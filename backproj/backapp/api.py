@@ -11,6 +11,7 @@ from django.utils.encoding import force_bytes
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from rest_framework_simplejwt.views import TokenRefreshView
+from django.views.decorators.csrf import csrf_exempt
 
 api = NinjaAPI(title="Slayers API docs")
 
@@ -33,6 +34,7 @@ def send_verification_email(user):
         [user.email],
     )
 
+@csrf_exempt
 @api.post("/signup")
 def signup(request, data:SignupSchema):
     if not verify_recaptcha(data.recaptcha_token):
@@ -55,6 +57,7 @@ def signup(request, data:SignupSchema):
     send_verification_email(user)
     return {"message": "User registered. Please check your email to verify your account."}
 
+@csrf_exempt
 @api.get("/verify-email/{uidb64}/{token}")
 def verify_email(request, uidb64: str, token: str):
     try:
@@ -70,12 +73,13 @@ def verify_email(request, uidb64: str, token: str):
     else:
         return api.create_response(request, {"error": "Invalid or expired token"}, status=400)
 
+@csrf_exempt
 @api.post("/refresh")
 def refresh(request):
     view = TokenRefreshView.as_view()
     return view(request._request)
 
-
+@csrf_exempt
 @api.post("/login", response=TokenSchema)
 def login(request, data: LoginSchema):
     if not verify_recaptcha(data.recaptcha_token):
