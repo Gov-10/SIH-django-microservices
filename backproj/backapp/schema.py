@@ -17,3 +17,7 @@ class LoginSchema(Schema):
 class TokenSchema(Schema):
     access: str
     refresh : str
+
+class JobSchema(Schema):
+    job_name : str
+    text_input : str

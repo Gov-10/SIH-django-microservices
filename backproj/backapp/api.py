@@ -1,6 +1,6 @@
 from ninja import NinjaAPI
 from django.contrib.auth.models import User
-from .schema import SignupSchema, LoginSchema, TokenSchema
+from .schema import SignupSchema, LoginSchema, TokenSchema, JobSchema
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.core.exceptions import ValidationError
@@ -11,7 +11,10 @@ from django.utils.encoding import force_bytes
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from rest_framework_simplejwt.views import TokenRefreshView
-
+import json, pika
+import os
+from .models import MLJob
+from django.views.decorators.csrf import csrf_exempt
 api = NinjaAPI(title="Slayers API docs")
 
 def verify_recaptcha(token: str) -> bool:
@@ -33,6 +36,21 @@ def send_verification_email(user):
         [user.email],
     )
 
+def publish_to_queue(queue_name, message):
+    connection = pika.BlockingConnection(
+        pika.ConnectionParameters(host=os.getenv("RABBITMQ_HOST", "localhost"))
+    )
+    channel = connection.channel()
+    channel.queue_declare(queue=queue_name, durable=True)
+    channel.basic_publish(
+        exchange="",
+        routing_key=queue_name,
+        body=json.dumps(message),
+        properties=pika.BasicProperties(delivery_mode=2),
+    )
+    connection.close()
+
+@csrf_exempt
 @api.post("/signup")
 def signup(request, data:SignupSchema):
     if not verify_recaptcha(data.recaptcha_token):
@@ -55,6 +73,7 @@ def signup(request, data:SignupSchema):
     send_verification_email(user)
     return {"message": "User registered. Please check your email to verify your account."}
 
+@csrf_exempt
 @api.get("/verify-email/{uidb64}/{token}")
 def verify_email(request, uidb64: str, token: str):
     try:
@@ -75,7 +94,7 @@ def refresh(request):
     view = TokenRefreshView.as_view()
     return view(request._request)
 
-
+@csrf_exempt
 @api.post("/login", response=TokenSchema)
 def login(request, data: LoginSchema):
     if not verify_recaptcha(data.recaptcha_token):
@@ -90,3 +109,28 @@ def login(request, data: LoginSchema):
 
     refresh = RefreshToken.for_user(user)
     return {"access": str(refresh.access_token), "refresh": str(refresh)}
+
+@csrf_exempt
+@api.post("/submit-job")
+def submit_job(request, data: JobSchema):
+    user = request.user if request.user.is_authenticated else None
+    
+    job = MLJob.objects.create(
+        job_name=data.job_name,
+        text_input=data.text_input,
+        status="pending"
+    )
+    publish_to_queue("ml_jobs", {
+        "job_id": job.job_id,
+        "text_input": data.text_input,
+    })
+    return {"message": "Job submitted successfully. Processing in background.", "job_id": job.job_id}
+
+@csrf_exempt
+@api.get("/job-status/{job_id}")
+def job_status(request, job_id: int):
+    try:
+        job = MLJob.objects.get(pk=job_id)
+        return {"status": job.status, "result": job.result}
+    except MLJob.DoesNotExist:
+        return api.create_response(request, {"error": "Job not found"}, status=404)
