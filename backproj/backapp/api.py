@@ -15,14 +15,23 @@ import json, pika
 import os
 from .models import MLJob
 from django.views.decorators.csrf import csrf_exempt
+from django.core.paginator import Paginator
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from ninja.security import HttpBearer
+from rest_framework_simplejwt.exceptions import TokenError
+
 api = NinjaAPI(title="Slayers API docs")
 
 def verify_recaptcha(token: str) -> bool:
     url = "https://www.google.com/recaptcha/api/siteverify"
-    payload = {"secret": settings.RECAPTCHA_SECRET_KEY, "response": token}
+    payload = {"secret": settings.RECAPTCHA_PRIVATE_KEY, "response": token}
     r = requests.post(url, data=payload)
     result = r.json()
-    return result.get("success", False) and result.get("score", 0.5) >= 0.5
+    if not result.get("success", False):
+        return False
+    if "score" in result:
+        return result["score"] >= 0.5
+    return True
 
 def send_verification_email(user):
     uid = urlsafe_base64_encode(force_bytes(user.pk))
@@ -38,7 +47,7 @@ def send_verification_email(user):
 
 def publish_to_queue(queue_name, message):
     connection = pika.BlockingConnection(
-        pika.ConnectionParameters(host=os.getenv("RABBITMQ_HOST", "localhost"))
+        pika.URLParameters(os.getenv("RABBITMQ_URL"))
     )
     channel = connection.channel()
     channel.queue_declare(queue=queue_name, durable=True)
@@ -49,6 +58,7 @@ def publish_to_queue(queue_name, message):
         properties=pika.BasicProperties(delivery_mode=2),
     )
     connection.close()
+
 
 @csrf_exempt
 @api.post("/signup")
@@ -110,12 +120,21 @@ def login(request, data: LoginSchema):
     refresh = RefreshToken.for_user(user)
     return {"access": str(refresh.access_token), "refresh": str(refresh)}
 
+class JWTAuth(HttpBearer):
+    def authenticate(self, request, token):
+        auth = JWTAuthentication()
+        try:
+            validated_token = auth.get_validated_token(token)
+            user = auth.get_user(validated_token)
+            return user
+        except TokenError:
+            return None
+
 @csrf_exempt
-@api.post("/submit-job")
+@api.post("/submit-job", auth=JWTAuth())
 def submit_job(request, data: JobSchema):
-    user = request.user if request.user.is_authenticated else None
-    
     job = MLJob.objects.create(
+        user=request.user,
         job_name=data.job_name,
         text_input=data.text_input,
         status="pending"
@@ -127,10 +146,41 @@ def submit_job(request, data: JobSchema):
     return {"message": "Job submitted successfully. Processing in background.", "job_id": job.job_id}
 
 @csrf_exempt
-@api.get("/job-status/{job_id}")
+@api.get("/job-status/{job_id}", auth=JWTAuth())
 def job_status(request, job_id: int):
+    user = request.user
     try:
         job = MLJob.objects.get(pk=job_id)
-        return {"status": job.status, "result": job.result}
     except MLJob.DoesNotExist:
         return api.create_response(request, {"error": "Job not found"}, status=404)
+    if job.user != user:
+        return api.create_response(request, {"error": "Unauthorized access"}, status=403)
+    return {"status": job.status, "result": job.result}
+
+    
+from django.contrib.auth import logout as django_logout
+@csrf_exempt
+@api.get("/logout")
+def logout(request):
+    django_logout(request)
+    return {"message": "Logout handled on client side by deleting the token."}
+
+@csrf_exempt
+@api.get("/jobs", auth=JWTAuth())
+def list_jobs(request, page: int = 1, page_size: int = 10):
+    user = request.user
+    jobs = MLJob.objects.filter(user=user).order_by("-created_at")
+    paginator = Paginator(jobs, page_size)
+    page_obj = paginator.get_page(page)
+    job_list = [{
+        "job_id": job.job_id,
+        "job_name": job.job_name,
+        "status": job.status,
+        "result": job.result,
+        "created_at": job.created_at
+    } for job in page_obj]
+    return {
+        "jobs": job_list,
+        "total_pages": paginator.num_pages,
+        "current_page": page
+    }
